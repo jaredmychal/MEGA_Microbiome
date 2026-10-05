@@ -1,0 +1,434 @@
+---
+title: "MEGA study — predictive and multivariate modelling"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: false
+    df_print: kable
+    theme: readable
+    highlight: tango
+---
+
+```{r}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  echo = TRUE,
+  comment = "#>"
+)
+```
+
+Code and results for the classification and multi-omics models in the MEGA
+study. Each section gives one analysis and the result it produces. Model
+fitting is shown but not re-executed on render; results are read back from the
+saved object named in the chunk beneath each model.
+
+All classification analyses use responder status as the outcome and are
+restricted to the 57 trained participants.
+
+```{r}
+library(tidyverse)
+library(pROC)
+library(caret)
+library(knitr)
+library(mixOmics)
+```
+
+
+# DIABLO multi-omics integration, POST
+
+Three blocks: dietary intake, microbiota genus relative abundance, and serum
+markers (zonulin, irisin, nine cytokines, faecal SCFAs, blood and plasma volume
+measures, blood lactate and endotoxin). The serum block is named `cytokines` in
+the code.
+
+keepX is tuned and each block's AUC is computed with `auroc` on the same 57
+participants used to fit the model, so the AUCs describe model fit rather than
+out-of-sample performance and are exploratory. This applies to all three DIABLO
+models.
+
+```{r, eval = FALSE}
+#### Blocks ####
+
+X <- list(
+  diet = as.matrix(metadata[dietary_names]),
+  microbiome = as.matrix(taxa[taxa_names]),
+  cytokines = as.matrix(metadata[biomarker_cols])
+)
+Y <- factor(metadata$Responder, levels = c("No", "Yes"))
+
+design <- matrix(0.3, ncol = 3, nrow = 3, dimnames = list(names(X), names(X)))
+diag(design) <- 0
+
+NCOMP <- 2
+KEEPX_GRID <- 3:15
+
+
+#### Feature tuning ####
+
+set.seed(123)
+tune_full <- tune.block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = NCOMP,
+  test.keepX = list(diet = KEEPX_GRID, microbiome = KEEPX_GRID, cytokines = KEEPX_GRID),
+  design = design,
+  validation = "Mfold",
+  folds = 3,
+  nrepeat = 5,
+  dist = "centroids.dist",
+  BPPARAM = BPP
+)
+keepX <- tune_full$choice.keepX
+
+
+#### Model ####
+
+final.diablo.model <- block.splsda(
+  X = X,
+  Y = Y,
+  ncomp = NCOMP,
+  keepX = keepX,
+  design = design
+)
+
+auroc(final.diablo.model, roc.block = "microbiome", roc.comp = NCOMP, print = FALSE)
+```
+
+```{r}
+a_post <- readRDS("results/diablo_post.rds")
+auc_post <- auroc(a_post$model, roc.comp = 2, print = FALSE, plot = FALSE)
+
+tibble(Block = names(auc_post), `Fitted AUC` = map_dbl(auc_post, ~ .x$comp2[1, "AUC"])) %>%
+  kable(digits = 3)
+```
+
+```{r}
+a_post$keepX
+```
+
+
+# DIABLO multi-omics integration, PRE
+
+The same blocks, tuning and model, with the timepoint filter set to PRE.
+
+```{r, eval = FALSE}
+metadata <- metadata %>% dplyr::filter(PRE_POST == "PRE")
+
+OTU_table <- physeq %>%
+  tax_fix() %>%
+  ps_filter(Group != "CT" & PRE_POST == "PRE") %>%
+  tax_filter(min_prevalence = 1/10, undetected = 100, tax_level = "Genus") %>%
+  tax_agg("Genus") %>%
+  tax_transform("compositional", zero_replace = "halfmin", chain = TRUE) %>%
+  tax_transform("log", zero_replace = "halfmin", chain = TRUE) %>%
+  ps_melt()
+```
+
+```{r}
+a_pre <- readRDS("results/diablo_pre.rds")
+auc_pre <- auroc(a_pre$model, roc.comp = 2, print = FALSE, plot = FALSE)
+
+tibble(Block = names(auc_pre), `Fitted AUC` = map_dbl(auc_pre, ~ .x$comp2[1, "AUC"])) %>%
+  kable(digits = 3)
+```
+
+```{r}
+a_pre$keepX
+```
+
+
+# DIABLO multi-omics integration, PRE-to-POST fold change
+
+Both timepoints are carried through the same transformation, then collapsed to
+one row per subject. The fold change is the POST value divided by the PRE
+value of the log-transformed abundance.
+
+```{r, eval = FALSE}
+#### Blocks, both timepoints retained ####
+
+OTU_table <- physeq %>%
+  tax_fix() %>%
+  ps_filter(Group != "CT") %>%
+  tax_filter(min_prevalence = 1/10, undetected = 100, tax_level = "Genus") %>%
+  tax_agg("Genus") %>%
+  tax_transform("compositional", zero_replace = "halfmin", chain = TRUE) %>%
+  tax_transform("log", zero_replace = "halfmin", chain = TRUE) %>%
+  ps_melt()
+
+taxa_fc <- taxa %>%
+  dplyr::arrange(MEGA_ID, PRE_POST) %>%
+  dplyr::group_by(MEGA_ID) %>%
+  dplyr::summarise(
+    dplyr::across(all_of(taxa_names), ~ .x[2] / .x[1]),
+    .groups = "drop"
+  )
+```
+
+```{r}
+d_fc <- readRDS("results/diablo_foldchange.rds")
+auc_fc <- auroc(d_fc$model, roc.comp = 2, print = FALSE, plot = FALSE)
+
+tibble(Block = names(auc_fc), `Fitted AUC` = map_dbl(auc_fc, ~ .x$comp2[1, "AUC"])) %>%
+  kable(digits = 3)
+```
+
+```{r}
+d_fc$keepX
+```
+
+
+# POST logistic regression
+
+Penalised logistic regression (elastic net via glmnet) on log10(x + 1)
+transformed genus abundances at POST, 10% prevalence filter, tuned by 10-fold
+cross-validation repeated 10 times. Because the genus ranking comes from a
+model fitted to all participants, performance is estimated by repeating the
+selection inside each of 100 outer cross-validation folds.
+
+```{r, eval = FALSE}
+ps_in <- physeq %>%
+  tax_fix() %>%
+  ps_filter(Group != "CT" & PRE_POST == "POST") %>%
+  tax_filter(undetected = 100, min_prevalence = 1/10, tax_level = "Genus")
+
+set.seed(123)
+mm_lr <- microbiomeMarker::run_sl(
+  ps_in,
+  group = "Responder",
+  nfolds = 10,
+  nrepeats = 10,
+  taxa_rank = "Genus",
+  norm = "none",
+  top_n = 15,
+  transform = "log10p",
+  method = "LR"
+)
+```
+
+```{r}
+lr <- readRDS("results/logistic_regression.rds")
+
+tibble(Metric = "Nested cross-validated AUC", Value = lr$auc[["nested"]]) %>%
+  kable(digits = 3)
+```
+
+The fifteen highest-importance genera.
+
+```{r}
+mk <- as.data.frame(microbiomeMarker::marker_table(lr$mm_lr))
+
+tibble(
+  Genus = as.character(mk$feature),
+  `Enriched in` = as.character(mk$enrich_group),
+  Importance = as.numeric(mk$ef_imp)
+) %>%
+  kable(digits = 2)
+```
+
+
+# PICRUSt2 pathway random forest, POST
+
+Random forest on MetaCyc pathway abundances at POST, with age and sex as
+additional predictors. Zeros are replaced with half of each pathway's minimum
+non-zero value and abundances are log(1 + x) transformed. Zero-variance and
+near-zero-variance pathways are removed within each resampling fold, and `mtry`
+is tuned over five values. AUCs are computed with the direction of comparison
+fixed to the responder class.
+
+```{r, eval = FALSE}
+rec <- recipe(Responder ~ ., data = rf_data_full) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors())
+
+set.seed(123)
+folds <- createMultiFolds(rf_data_full$Responder, k = 5, times = 3)
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  index = folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(123)
+rf_clean <- train(
+  rec,
+  data = rf_data_full,
+  method = "rf",
+  trControl = ctrl,
+  metric = "ROC",
+  importance = TRUE,
+  tuneLength = 5
+)
+```
+
+```{r}
+rf_post <- readRDS("results/random_forest_post.rds")
+pred_post <- rf_post$clean$pred %>% dplyr::filter(mtry == rf_post$clean$bestTune$mtry)
+
+tibble(
+  Metric = c("Cross-validated AUC", "mtry"),
+  Value = c(
+    as.numeric(auc(roc(pred_post$obs, pred_post$Yes, levels = c("No", "Yes"), direction = "<", quiet = TRUE))),
+    rf_post$clean$bestTune$mtry
+  )
+) %>%
+  kable(digits = 3)
+```
+
+```{r}
+read_csv("results/random_forest_post_importance.csv", show_col_types = FALSE) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::select(Pathway = variable, Importance = importance) %>%
+  kable(digits = 2)
+```
+
+
+# PICRUSt2 pathway random forest, PRE-to-POST
+
+Random forest on MetaCyc pathway abundances, PRE-to-POST ratio, with age and
+sex as additional predictors. Zeros are replaced with half of each pathway's
+minimum non-zero value and abundances are log(1 + x) transformed. Zero-variance,
+near-zero-variance and highly correlated pathways are removed within each
+resampling fold, and `mtry` is tuned over five values.
+
+```{r, eval = FALSE}
+rec <- recipe(Responder ~ ., data = rf_data_full) %>%
+  step_zv(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_corr(all_numeric_predictors(), -Age, threshold = 0.9)
+
+set.seed(123)
+folds <- createMultiFolds(rf_data_full$Responder, k = 5, times = 3)
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  index = folds,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+set.seed(123)
+rf_clean <- train(
+  rec,
+  data = rf_data_full,
+  method = "rf",
+  trControl = ctrl,
+  metric = "ROC",
+  importance = TRUE,
+  tuneLength = 5
+)
+```
+
+```{r}
+rf <- readRDS("results/random_forest.rds")
+pred_clean <- rf$clean$pred %>% dplyr::filter(mtry == rf$clean$bestTune$mtry)
+
+tibble(
+  Metric = c("Cross-validated AUC", "mtry"),
+  Value = c(
+    as.numeric(auc(roc(pred_clean$obs, pred_clean$Yes, levels = c("No", "Yes"), direction = "<", quiet = TRUE))),
+    rf$clean$bestTune$mtry
+  )
+) %>%
+  kable(digits = 3)
+```
+
+```{r}
+read_csv("results/random_forest_importance.csv", show_col_types = FALSE) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::select(Pathway = variable, Importance = importance) %>%
+  kable(digits = 2)
+```
+
+
+# selbal balance
+
+selbal on POST genus abundances, 10% prevalence filter, maximum of 12 taxa,
+deviance as the selection criterion. The input is already log-transformed, so
+selbal's own log transformation is switched off (`logt = FALSE`).
+
+```{r, eval = FALSE}
+combined <- physeq %>%
+  tax_fix() %>%
+  tax_filter(min_prevalence = 1/10, undetected = 100, tax_level = "Genus") %>%
+  ps_filter(PRE_POST == "POST" & Group != "CT") %>%
+  tax_agg("Genus") %>%
+  tax_transform("compositional", zero_replace = "halfmin", chain = TRUE) %>%
+  tax_transform("log", zero_replace = 1, chain = TRUE) %>%
+  ps_melt()
+
+set.seed(123)
+sb <- selbal(
+  x = as.matrix(combined[microbe_names]),
+  y = if_else(combined$Responder == "Yes", 1, 0),
+  maxV = 12,
+  logit.acc = "Dev",
+  draw = FALSE,
+  logt = FALSE
+)
+```
+
+```{r}
+sb <- readRDS("results/selbal_balance.rds")
+
+tibble(
+  Side = c(rep("Numerator", length(sb$numerator)), rep("Denominator", length(sb$denominator))),
+  Taxon = c(sb$numerator, sb$denominator)
+) %>%
+  kable()
+```
+
+# Fast-and-frugal trees
+
+FFTrees fitted separately at PRE and POST to log-transformed genus abundances
+with age, BMI, mHEI score and sex, 15% prevalence filter. Participants are
+split once into training and test halves; cues and thresholds are selected on
+the training half.
+
+```{r, eval = FALSE}
+mat <- physeq %>%
+  tax_fix() %>%
+  ps_filter(Group != "CT" & PRE_POST == "PRE") %>%
+  tax_filter(undetected = 100, min_prevalence = 1.5/10, tax_level = "Genus")
+
+set.seed(123)
+train_ind <- caret::createDataPartition(mat$Responder, p = 0.5, list = FALSE)
+
+pub <- FFTrees(
+  Responder ~ .,
+  data = mat[train_ind, ],
+  data.test = mat[-train_ind, ],
+  quiet = TRUE
+)
+```
+
+PRE tree.
+
+```{r}
+readRDS("results/fft_pre.rds")$published %>%
+  dplyr::select(Level = level, Cue = cue, Direction = dir, Threshold = thr) %>%
+  kable()
+```
+
+POST tree.
+
+```{r}
+readRDS("results/fft_post.rds")$published %>%
+  dplyr::select(Level = level, Cue = cue, Direction = dir, Threshold = thr) %>%
+  kable()
+```
+
+
+# Session information
+
+```{r}
+sessionInfo()
+```
